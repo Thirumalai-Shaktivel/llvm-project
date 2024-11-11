@@ -144,6 +144,18 @@ subroutine task_depend_multi_task()
   x = x + 12
   !CHECK: omp.terminator
   !$omp end task
+  !CHECK: omp.task depend(taskdependmutexinoutset -> %{{.+}} : !fir.ref<i32>)
+  !$omp task depend(mutexinoutset : x)
+  !CHECK: arith.subi
+  x = x - 12
+  !CHECK: omp.terminator
+  !$omp end task
+    !CHECK: omp.task depend(taskdependinoutset -> %{{.+}} : !fir.ref<i32>)
+  !$omp task depend(inoutset : x)
+  !CHECK: arith.subi
+  x = x - 12
+  !CHECK: omp.terminator
+  !$omp end task
 end subroutine task_depend_multi_task
 
 !===============================================================================
@@ -183,7 +195,7 @@ subroutine task_firstprivate
   type mytype
   integer :: x
   end type mytype
- 
+
   !CHECK: %[[INT_ALLOCA:.+]] = fir.alloca i32 {bindc_name = "int_var", uniq_name = "_QFtask_firstprivateEint_var"}
   !CHECK: %[[INT_VAR:.+]]:2 = hlfir.declare %[[INT_ALLOCA]] {uniq_name = "_QFtask_firstprivateEint_var"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
   !CHECK: %[[MYTYPE_ALLOCA:.+]] = fir.alloca !fir.type<_QFtask_firstprivateTmytype{x:i32}> {bindc_name = "mytype_var", uniq_name = "_QFtask_firstprivateEmytype_var"}

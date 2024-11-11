@@ -124,7 +124,6 @@ static mlir::omp::ClauseTaskDependAttr
 genDependKindAttr(lower::AbstractConverter &converter,
                   const omp::clause::Depend::TaskDependenceType kind) {
   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
-  mlir::Location currentLocation = converter.getCurrentLocation();
 
   mlir::omp::ClauseTaskDepend pbKind;
   switch (kind) {
@@ -138,8 +137,10 @@ genDependKindAttr(lower::AbstractConverter &converter,
     pbKind = mlir::omp::ClauseTaskDepend::taskdependinout;
     break;
   case omp::clause::Depend::TaskDependenceType::Mutexinoutset:
+    pbKind = mlir::omp::ClauseTaskDepend::taskdependmutexinoutset;
+    break;
   case omp::clause::Depend::TaskDependenceType::Inoutset:
-    TODO(currentLocation, "INOUTSET and MUTEXINOUTSET are not supported yet");
+    pbKind = mlir::omp::ClauseTaskDepend::taskdependinoutset;
     break;
   case omp::clause::Depend::TaskDependenceType::Depobj:
   case omp::clause::Depend::TaskDependenceType::Sink:

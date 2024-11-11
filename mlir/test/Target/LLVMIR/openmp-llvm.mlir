@@ -2573,6 +2573,20 @@ llvm.func @omp_task_attrs() -> () attributes {
 // CHECK:  store i64 8, ptr %[[dep_arr_addr_0_size]], align 4
 // CHECK:  %[[dep_arr_addr_0_kind:.+]] = getelementptr inbounds nuw %struct.kmp_dep_info, ptr %[[dep_arr_addr_0]], i32 0, i32 2
 // CHECK: store i8 1, ptr %[[dep_arr_addr_0_kind]], align 1
+// -----
+// dependence_type: Mutexinoutset
+// CHECK:  %[[dep_arr_addr1:.+]] = alloca [1 x %struct.kmp_dep_info], align 8
+// CHECK:  %[[dep_arr_addr_1:.+]] = getelementptr inbounds [1 x %struct.kmp_dep_info], ptr %[[dep_arr_addr1]], i64 0, i64 0
+//         [...]
+// CHECK:  %[[dep_type_1:.+]] = getelementptr inbounds nuw %struct.kmp_dep_info, ptr %[[dep_arr_addr_1]], i32 0, i32 2
+// CHECK:  store i8 4, ptr %[[dep_type_1]], align 1
+// -----
+// dependence_type: Inoutset
+// CHECK:  %[[dep_arr_addr2:.+]] = alloca [1 x %struct.kmp_dep_info], align 8
+// CHECK:  %[[dep_arr_addr_2:.+]] = getelementptr inbounds [1 x %struct.kmp_dep_info], ptr %[[dep_arr_addr2]], i64 0, i64 0
+//         [...]
+// CHECK:  %[[dep_type_2:.+]] = getelementptr inbounds nuw %struct.kmp_dep_info, ptr %[[dep_arr_addr_2]], i32 0, i32 2
+// CHECK:  store i8 8, ptr %[[dep_type_2]], align 1
 llvm.func @omp_task_with_deps(%zaddr: !llvm.ptr) {
   // CHECK: %[[omp_global_thread_num:.+]] = call i32 @__kmpc_global_thread_num({{.+}})
   // CHECK: %[[task_data:.+]] = call ptr @__kmpc_omp_task_alloc
@@ -2585,6 +2599,14 @@ llvm.func @omp_task_with_deps(%zaddr: !llvm.ptr) {
     %val = llvm.load %valaddr : !llvm.ptr -> i32
     %double = llvm.add %val, %val : i32
     llvm.store %double, %valaddr : i32, !llvm.ptr
+    omp.terminator
+  }
+
+  omp.task depend(taskdependmutexinoutset -> %zaddr : !llvm.ptr) {
+    omp.terminator
+  }
+
+  omp.task depend(taskdependinoutset -> %zaddr : !llvm.ptr) {
     omp.terminator
   }
   llvm.return
