@@ -1816,11 +1816,10 @@ static Value *emitTaskDependencies(
   return DepArray;
 }
 
-OpenMPIRBuilder::InsertPointOrErrorTy
-OpenMPIRBuilder::createTask(const LocationDescription &Loc,
-                            InsertPointTy AllocaIP, BodyGenCallbackTy BodyGenCB,
-                            bool Tied, Value *Final, Value *IfCondition,
-                            SmallVector<DependData> Dependencies) {
+OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createTask(
+    const LocationDescription &Loc, InsertPointTy AllocaIP,
+    BodyGenCallbackTy BodyGenCB, bool Tied, Value *Final, Value *IfCondition,
+    Value *Priority, SmallVector<DependData> Dependencies, Value *EventHandle) {
 
   if (!updateToLocation(Loc))
     return InsertPointTy();
@@ -1865,8 +1864,9 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
   OI.ExcludeArgsFromAggregate.push_back(createFakeIntVal(
       Builder, AllocaIP, ToBeDeleted, TaskAllocaIP, "global.tid", false));
 
-  OI.PostOutlineCB = [this, Ident, Tied, Final, IfCondition, Dependencies,
-                      TaskAllocaBB, ToBeDeleted](Function &OutlinedFn) mutable {
+  OI.PostOutlineCB = [this, Ident, Tied, Final, IfCondition, Priority,
+                      Dependencies, EventHandle, TaskAllocaBB,
+                      ToBeDeleted](Function &OutlinedFn) mutable {
     // Replace the Stale CI by appropriate RTL function call.
     assert(OutlinedFn.getNumUses() == 1 &&
            "there must be a single user for the outlined function");
@@ -1891,12 +1891,18 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
     // Task is untied iff (Flags & 1) == 0.
     // Task is final iff (Flags & 2) == 2.
     // Task is not final iff (Flags & 2) == 0.
+    // Task is priority iff (Flags & 32) == 32.
+    // Task is not priority iff (Flags & 32) == 0.
     // TODO: Handle the other flags.
     Value *Flags = Builder.getInt32(Tied);
     if (Final) {
       Value *FinalFlag =
           Builder.CreateSelect(Final, Builder.getInt32(2), Builder.getInt32(0));
       Flags = Builder.CreateOr(FinalFlag, Flags);
+    }
+
+    if (Priority) {
+      Flags = Builder.CreateOr(Builder.getInt32(32), Flags);
     }
 
     // Argument - `sizeof_kmp_task_t` (TaskSize)
@@ -1931,6 +1937,20 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
                       /*sizeof_task=*/TaskSize, /*sizeof_shared=*/SharedsSize,
                       /*task_func=*/&OutlinedFn});
 
+    // Emit detach clause initialization.
+    // evt = (typeof(evt))__kmpc_task_allow_completion_event(loc, tid,
+    // task_descriptor);
+    if (EventHandle) {
+      Function *TaskDetachFn = getOrCreateRuntimeFunctionPtr(
+          OMPRTL___kmpc_task_allow_completion_event);
+      llvm::Value *EventVal =
+          Builder.CreateCall(TaskDetachFn, {Ident, ThreadID, TaskData});
+      llvm::Value *EventHandleAddr =
+          Builder.CreatePointerBitCastOrAddrSpaceCast(EventHandle,
+                                                      Builder.getPtrTy(0));
+      EventVal = Builder.CreatePtrToInt(EventVal, Builder.getInt64Ty());
+      Builder.CreateStore(EventVal, EventHandleAddr);
+    }
     // Copy the arguments for outlined function
     if (HasShareds) {
       Value *Shareds = StaleCI->getArgOperand(1);
@@ -1938,6 +1958,17 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
       Value *TaskShareds = Builder.CreateLoad(VoidPtr, TaskData);
       Builder.CreateMemCpy(TaskShareds, Alignment, Shareds, Alignment,
                            SharedsSize);
+    }
+
+    if (Priority) {
+      Type *IndexTy = Builder.getIndexTy(
+          M.getDataLayout(), M.getDataLayout().getDefaultGlobalsAddressSpace());
+      Type *structType = llvm::StructType::get(
+          VoidPtr, VoidPtr, Builder.getInt32Ty(), VoidPtr, VoidPtr);
+      Value *priorityData = Builder.CreateInBoundsGEP(
+          structType, Builder.CreateLoad(VoidPtr, TaskData),
+          {ConstantInt::get(IndexTy, 0), ConstantInt::get(IndexTy, 4)});
+      Builder.CreateStore(Priority, priorityData);
     }
 
     Value *DepArray = nullptr;
