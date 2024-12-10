@@ -89,7 +89,7 @@ public:
   bool processThreadLimit(lower::StatementContext &stmtCtx,
                           mlir::omp::ThreadLimitClauseOps &result) const;
   bool processUntied(mlir::omp::UntiedClauseOps &result) const;
-
+  bool processDetach(mlir::omp::DetachClauseOps &result) const;
   // 'Repeatable' clauses: They can appear multiple times in the clause list.
   bool processAligned(mlir::omp::AlignedClauseOps &result) const;
   bool processAllocate(mlir::omp::AllocateClauseOps &result) const;
@@ -122,6 +122,13 @@ public:
   bool processReduction(
       mlir::Location currentLocation, mlir::omp::ReductionClauseOps &result,
       llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSyms) const;
+  bool processTaskReduction(mlir::Location currentLocation,
+                            mlir::omp::TaskReductionClauseOps &result,
+                            llvm::SmallVectorImpl<const semantics::Symbol *>
+                                &TaskReductionSyms) const;
+  bool processInReduction(
+      mlir::Location currentLocation, mlir::omp::InReductionClauseOps &result,
+      llvm::SmallVectorImpl<const semantics::Symbol *> &InReductionSyms) const;
   bool processTo(llvm::SmallVectorImpl<DeclareTargetCapturePair> &result) const;
   bool processUseDeviceAddr(
       lower::StatementContext &stmtCtx,

@@ -178,11 +178,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
     if (op.getIfExpr())
       result = todo("if");
   };
-  auto checkInReduction = [&todo](auto op, LogicalResult &result) {
-    if (!op.getInReductionVars().empty() || op.getInReductionByref() ||
-        op.getInReductionSyms())
-      result = todo("in_reduction");
-  };
   auto checkIsDevicePtr = [&todo](auto op, LogicalResult &result) {
     if (!op.getIsDevicePtrVars().empty())
       result = todo("is_device_ptr");
@@ -207,10 +202,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
     if (op.getParLevelSimd())
       result = todo("parallelization-level");
   };
-  auto checkPriority = [&todo](auto op, LogicalResult &result) {
-    if (op.getPriority())
-      result = todo("priority");
-  };
   auto checkPrivate = [&todo](auto op, LogicalResult &result) {
     if (!op.getPrivateVars().empty() || op.getPrivateSyms())
       result = todo("privatization");
@@ -223,15 +214,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
   auto checkThreadLimit = [&todo](auto op, LogicalResult &result) {
     if (op.getThreadLimit())
       result = todo("thread_limit");
-  };
-  auto checkTaskReduction = [&todo](auto op, LogicalResult &result) {
-    if (!op.getTaskReductionVars().empty() || op.getTaskReductionByref() ||
-        op.getTaskReductionSyms())
-      result = todo("task_reduction");
-  };
-  auto checkUntied = [&todo](auto op, LogicalResult &result) {
-    if (op.getUntied())
-      result = todo("untied");
   };
 
   LogicalResult result = success();
@@ -250,16 +232,8 @@ static LogicalResult checkImplementationStatus(Operation &op) {
         checkPrivate(op, result);
         checkReduction(op, result);
       })
-      .Case([&](omp::TaskOp op) {
-        checkAllocate(op, result);
-        checkInReduction(op, result);
-        checkPriority(op, result);
-        checkUntied(op, result);
-      })
-      .Case([&](omp::TaskgroupOp op) {
-        checkAllocate(op, result);
-        checkTaskReduction(op, result);
-      })
+      .Case([&](omp::TaskOp op) { checkAllocate(op, result); })
+      .Case([&](omp::TaskgroupOp op) { checkAllocate(op, result); })
       .Case([&](omp::TaskwaitOp op) {
         checkDepend(op, result);
         checkNowait(op, result);
@@ -286,7 +260,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
         checkDevice(op, result);
         checkHasDeviceAddr(op, result);
         checkIf(op, result);
-        checkInReduction(op, result);
         checkIsDevicePtr(op, result);
         // Privatization clauses are supported, except on some situations, so we
         // need to check here whether any of these unsupported cases are being
@@ -1709,6 +1682,49 @@ convertOmpTaskOp(omp::TaskOp taskOp, llvm::IRBuilderBase &builder,
 
     // translate the body of the task:
     builder.restoreIP(codegenIP);
+
+    if (taskOp.getInReductionSyms()) {
+      llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+      builder.restoreIP(codegenIP);
+      uint32_t SrcLocStrSize;
+      llvm::LLVMContext &Context = builder.getContext();
+      llvm::Constant *SrcLocStr =
+          moduleTranslation.getOpenMPBuilder()->getOrCreateSrcLocStr(
+              ompLoc, SrcLocStrSize);
+      llvm::Value *Ident =
+          moduleTranslation.getOpenMPBuilder()->getOrCreateIdent(SrcLocStr,
+                                                                 SrcLocStrSize);
+      llvm::Value *ThreadID =
+          moduleTranslation.getOpenMPBuilder()->getOrCreateThreadID(Ident);
+      MutableArrayRef<BlockArgument> reductionArgs =
+          taskOp.getRegion().getArguments();
+      llvm::Value *tg =
+          llvm::ConstantPointerNull::get(llvm::PointerType::get(Context, 0));
+
+      // Check whether in_reduction is enclosed in a taskgroup
+      // If it is, pass the taskgroup id enclosing the task
+      auto op = taskOp->getParentOfType<omp::TaskgroupOp>();
+      if (op && moduleTranslation.lookupCall(op)) {
+        tg = moduleTranslation.lookupCall(op);
+      }
+      // Call back function for emitTaskReductionGetThdata
+      auto emitTaskReductionGetThdata = [&](llvm::Value *OrigVal) {
+        llvm::Value *args[] = {ThreadID, tg, OrigVal};
+        // Emit the runtime call
+        llvm::Function *ReductionGetFn =
+            moduleTranslation.getOpenMPBuilder()->getOrCreateRuntimeFunctionPtr(
+                llvm::omp::OMPRTL___kmpc_task_reduction_get_th_data);
+        return builder.CreateCall(ReductionGetFn, args);
+      };
+      std::size_t index = 0;
+      for (mlir::Value inReductionVar : taskOp.getInReductionVars()) {
+        llvm::Value *Result = emitTaskReductionGetThdata(
+            moduleTranslation.lookupValue(inReductionVar));
+        moduleTranslation.mapValue(reductionArgs[index], Result);
+        index++;
+      }
+    }
+
     auto continuationBlockOrError = convertOmpOpRegions(
         taskOp.getRegion(), "omp.task.region", builder, moduleTranslation);
     if (failed(handleError(continuationBlockOrError, *taskOp)))
@@ -1734,7 +1750,8 @@ convertOmpTaskOp(omp::TaskOp taskOp, llvm::IRBuilderBase &builder,
       moduleTranslation.getOpenMPBuilder()->createTask(
           ompLoc, allocaIP, bodyCB, !taskOp.getUntied(),
           moduleTranslation.lookupValue(taskOp.getFinal()),
-          moduleTranslation.lookupValue(taskOp.getIfExpr()), dds,
+          moduleTranslation.lookupValue(taskOp.getIfExpr()),
+          moduleTranslation.lookupValue(taskOp.getPriority()), dds,
           taskOp.getMergeable(),
           moduleTranslation.lookupValue(taskOp.getEventHandle()));
 
@@ -1745,6 +1762,239 @@ convertOmpTaskOp(omp::TaskOp taskOp, llvm::IRBuilderBase &builder,
   return success();
 }
 
+template <typename OP>
+llvm::Value *createTaskReductionFunction(
+    llvm::IRBuilderBase &builder, const std::string &name, llvm::Type *redTy,
+    LLVM::ModuleTranslation &moduleTranslation,
+    SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls, Region &region,
+    OP &op, unsigned Cnt, llvm::ArrayRef<bool> &isByRef,
+    SmallVectorImpl<llvm::Value *> &privateReductionVariables,
+    DenseMap<Value, llvm::Value *> &reductionVariableMap) {
+  llvm::LLVMContext &Context = builder.getContext();
+  llvm::Type *OpaquePtrTy = llvm::PointerType::get(Context, 0);
+  if (region.empty()) {
+    return llvm::Constant::getNullValue(OpaquePtrTy);
+  }
+  llvm::FunctionType *funcType = nullptr;
+  if (isByRef[Cnt])
+    funcType = llvm::FunctionType::get(builder.getVoidTy(),
+                                       {OpaquePtrTy, OpaquePtrTy}, false);
+  else
+    funcType =
+        llvm::FunctionType::get(OpaquePtrTy, {OpaquePtrTy, OpaquePtrTy}, false);
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::Function::ExternalLinkage, name,
+                             builder.GetInsertBlock()->getModule());
+  function->setDoesNotRecurse();
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(Context, "entry", function);
+  llvm::IRBuilder<> bbBuilder(entry);
+
+  llvm::Value *arg0 = function->getArg(0);
+  llvm::Value *arg1 = function->getArg(1);
+
+  if (name == "red_init") {
+    function->addParamAttr(0, llvm::Attribute::NoAlias);
+    function->addParamAttr(1, llvm::Attribute::NoAlias);
+    if (isByRef[Cnt]) {
+      // TODO: Handle case where the initializer uses initialization from
+      // declare reduction construct using `arg1Alloca`.
+      llvm::AllocaInst *arg0Alloca =
+          bbBuilder.CreateAlloca(bbBuilder.getPtrTy());
+      llvm::AllocaInst *arg1Alloca =
+          bbBuilder.CreateAlloca(bbBuilder.getPtrTy());
+      bbBuilder.CreateStore(arg0, arg0Alloca);
+      bbBuilder.CreateStore(arg1, arg1Alloca);
+      llvm::Value *LoadVal =
+          bbBuilder.CreateLoad(bbBuilder.getPtrTy(), arg0Alloca);
+      moduleTranslation.mapValue(reductionDecls[Cnt].getInitializerAllocArg(),
+                                 LoadVal);
+    } else {
+      mapInitializationArgs(op, moduleTranslation, reductionDecls,
+                            reductionVariableMap, Cnt);
+    }
+  } else if (name == "red_comb") {
+    if (isByRef[Cnt]) {
+      llvm::AllocaInst *arg0Alloca =
+          bbBuilder.CreateAlloca(bbBuilder.getPtrTy());
+      llvm::AllocaInst *arg1Alloca =
+          bbBuilder.CreateAlloca(bbBuilder.getPtrTy());
+      bbBuilder.CreateStore(arg0, arg0Alloca);
+      bbBuilder.CreateStore(arg1, arg1Alloca);
+      llvm::Value *arg0L =
+          bbBuilder.CreateLoad(bbBuilder.getPtrTy(), arg0Alloca);
+      llvm::Value *arg1L =
+          bbBuilder.CreateLoad(bbBuilder.getPtrTy(), arg1Alloca);
+      moduleTranslation.mapValue(region.front().getArgument(0), arg0L);
+      moduleTranslation.mapValue(region.front().getArgument(1), arg1L);
+    } else {
+      llvm::Value *arg0L = bbBuilder.CreateLoad(redTy, arg0);
+      llvm::Value *arg1L = bbBuilder.CreateLoad(redTy, arg1);
+      moduleTranslation.mapValue(region.front().getArgument(0), arg0L);
+      moduleTranslation.mapValue(region.front().getArgument(1), arg1L);
+    }
+  }
+
+  SmallVector<llvm::Value *, 1> phis;
+  if (failed(inlineConvertOmpRegions(region, "", bbBuilder, moduleTranslation,
+                                     &phis)))
+    return nullptr;
+  assert(
+      phis.size() == 1 &&
+      "expected one value to be yielded from the reduction declaration region");
+  if (!isByRef[Cnt]) {
+    bbBuilder.CreateStore(phis[0], arg0);
+    bbBuilder.CreateRet(arg0); // Return from the function
+  } else {
+    bbBuilder.CreateRet(nullptr);
+  }
+  return function;
+}
+
+llvm::CallInst *
+emitTaskRedInitCall(llvm::IRBuilderBase &builder,
+                    LLVM::ModuleTranslation &moduleTranslation,
+                    const llvm::OpenMPIRBuilder::LocationDescription &ompLoc,
+                    int arraySize, llvm::Value *ArrayAlloca) {
+  llvm::LLVMContext &Context = builder.getContext();
+  uint32_t SrcLocStrSize;
+  llvm::Constant *SrcLocStr =
+      moduleTranslation.getOpenMPBuilder()->getOrCreateSrcLocStr(ompLoc,
+                                                                 SrcLocStrSize);
+  llvm::Value *Ident = moduleTranslation.getOpenMPBuilder()->getOrCreateIdent(
+      SrcLocStr, SrcLocStrSize);
+  llvm::Value *ThreadID =
+      moduleTranslation.getOpenMPBuilder()->getOrCreateThreadID(Ident);
+  llvm::Constant *ConstInt =
+      llvm::ConstantInt::get(llvm::Type::getInt32Ty(Context), arraySize);
+  llvm::Function *TaskRedInitFn =
+      moduleTranslation.getOpenMPBuilder()->getOrCreateRuntimeFunctionPtr(
+          llvm::omp::OMPRTL___kmpc_taskred_init);
+  return builder.CreateCall(TaskRedInitFn, {ThreadID, ConstInt, ArrayAlloca});
+}
+
+template <typename OP>
+static LogicalResult allocAndInitializeTaskReductionVars(
+    OP op, ArrayRef<BlockArgument> reductionArgs, llvm::IRBuilderBase &builder,
+    LLVM::ModuleTranslation &moduleTranslation,
+    llvm::OpenMPIRBuilder::InsertPointTy &allocaIP,
+    SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls,
+    SmallVectorImpl<llvm::Value *> &privateReductionVariables,
+    DenseMap<Value, llvm::Value *> &reductionVariableMap,
+    llvm::ArrayRef<bool> isByRef) {
+
+  if (op.getNumReductionVars() == 0)
+    return success();
+
+  llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+  llvm::LLVMContext &Context = builder.getContext();
+  SmallVector<DeferredStore> deferredStores;
+
+  // Save the current insertion point
+  auto oldIP = builder.saveIP();
+
+  // Set insertion point after the allocations
+  builder.SetInsertPoint(allocaIP.getBlock()->getTerminator());
+
+  // Define the kmp_taskred_input_t structure
+  llvm::StructType *kmp_taskred_input_t =
+      llvm::StructType::create(Context, "kmp_taskred_input_t");
+  llvm::Type *OpaquePtrTy = llvm::PointerType::get(Context, 0); // void*
+  llvm::Type *SizeTy = builder.getInt64Ty(); // size_t (assumed to be i64)
+  llvm::Type *FlagsTy = llvm::Type::getInt32Ty(Context); // flags (i32)
+
+  // Structure members
+  std::vector<llvm::Type *> structMembers = {
+      OpaquePtrTy, // reduce_shar (void*)
+      OpaquePtrTy, // reduce_orig (void*)
+      SizeTy,      // reduce_size (size_t)
+      OpaquePtrTy, // reduce_init (void*)
+      OpaquePtrTy, // reduce_fini (void*)
+      OpaquePtrTy, // reduce_comb (void*)
+      FlagsTy      // flags (i32)
+  };
+
+  kmp_taskred_input_t->setBody(structMembers);
+  int arraySize = op.getNumReductionVars();
+  llvm::ArrayType *ArrayTy =
+      llvm::ArrayType::get(kmp_taskred_input_t, arraySize);
+
+  // Allocate the array for kmp_taskred_input_t
+  llvm::AllocaInst *ArrayAlloca =
+      builder.CreateAlloca(ArrayTy, nullptr, "kmp_taskred_array");
+  // Restore the insertion point
+  builder.restoreIP(oldIP);
+  llvm::DataLayout DL = builder.GetInsertBlock()->getModule()->getDataLayout();
+
+  for (int Cnt = 0; Cnt < arraySize; ++Cnt) {
+    llvm::Value *shared =
+        moduleTranslation.lookupValue(op.getReductionVars()[Cnt]);
+    // Create a GEP to access the reduction element
+    llvm::Value *StructPtr = builder.CreateGEP(
+        ArrayTy, ArrayAlloca, {builder.getInt32(0), builder.getInt32(Cnt)},
+        "red_element");
+    llvm::Value *FieldPtrReduceShar = builder.CreateStructGEP(
+        kmp_taskred_input_t, StructPtr, 0, "reduce_shar");
+    builder.CreateStore(shared, FieldPtrReduceShar);
+
+    llvm::Value *FieldPtrReduceOrig = builder.CreateStructGEP(
+        kmp_taskred_input_t, StructPtr, 1, "reduce_orig");
+    builder.CreateStore(shared, FieldPtrReduceOrig);
+
+    // Store size of the reduction variable
+    llvm::Value *FieldPtrReduceSize = builder.CreateStructGEP(
+        kmp_taskred_input_t, StructPtr, 2, "reduce_size");
+    llvm::Type *redTy;
+    if (auto *alloca = dyn_cast<llvm::AllocaInst>(shared)) {
+      redTy = alloca->getAllocatedType();
+      uint64_t sizeInBytes = DL.getTypeAllocSize(redTy);
+      llvm::ConstantInt *sizeConst =
+          llvm::ConstantInt::get(llvm::Type::getInt64Ty(Context), sizeInBytes);
+      builder.CreateStore(sizeConst, FieldPtrReduceSize);
+    } else {
+      llvm_unreachable("Non alloca instruction found.");
+    }
+
+    // Initialize reduction variable
+    llvm::Value *FieldPtrReduceInit = builder.CreateStructGEP(
+        kmp_taskred_input_t, StructPtr, 3, "reduce_init");
+    llvm::Value *initFunction = createTaskReductionFunction(
+        builder, "red_init", redTy, moduleTranslation, reductionDecls,
+        reductionDecls[Cnt].getInitializerRegion(), op, Cnt, isByRef,
+        privateReductionVariables, reductionVariableMap);
+    builder.CreateStore(initFunction, FieldPtrReduceInit);
+
+    // Create finish and combine functions
+    llvm::Value *FieldPtrReduceFini = builder.CreateStructGEP(
+        kmp_taskred_input_t, StructPtr, 4, "reduce_fini");
+    llvm::Value *finiFunction = createTaskReductionFunction(
+        builder, "red_fini", redTy, moduleTranslation, reductionDecls,
+        reductionDecls[Cnt].getCleanupRegion(), op, Cnt, isByRef,
+        privateReductionVariables, reductionVariableMap);
+    builder.CreateStore(finiFunction, FieldPtrReduceFini);
+
+    llvm::Value *FieldPtrReduceComb = builder.CreateStructGEP(
+        kmp_taskred_input_t, StructPtr, 5, "reduce_comb");
+    llvm::Value *combFunction = createTaskReductionFunction(
+        builder, "red_comb", redTy, moduleTranslation, reductionDecls,
+        reductionDecls[Cnt].getReductionRegion(), op, Cnt, isByRef,
+        privateReductionVariables, reductionVariableMap);
+    builder.CreateStore(combFunction, FieldPtrReduceComb);
+
+    llvm::Value *FieldPtrFlags =
+        builder.CreateStructGEP(kmp_taskred_input_t, StructPtr, 6, "flags");
+    llvm::ConstantInt *flagVal =
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(Context), 0);
+    builder.CreateStore(flagVal, FieldPtrFlags);
+  }
+
+  // Emit the runtime call
+  llvm::CallInst *CallResult = emitTaskRedInitCall(
+      builder, moduleTranslation, ompLoc, arraySize, ArrayAlloca);
+  moduleTranslation.mapCall(op, CallResult);
+  return success();
+}
+
 /// Converts an OpenMP taskgroup construct into LLVM IR using OpenMPIRBuilder.
 static LogicalResult
 convertOmpTaskgroupOp(omp::TaskgroupOp tgOp, llvm::IRBuilderBase &builder,
@@ -1752,11 +2002,29 @@ convertOmpTaskgroupOp(omp::TaskgroupOp tgOp, llvm::IRBuilderBase &builder,
   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
   if (failed(checkImplementationStatus(*tgOp)))
     return failure();
+  LogicalResult bodyGenStatus = success();
+  llvm::ArrayRef<bool> isByRef = getIsByRef(tgOp.getTaskReductionByref());
+  assert(isByRef.size() == tgOp.getNumReductionVars());
+  SmallVector<omp::DeclareReductionOp> reductionDecls;
+  collectReductionDecls(tgOp, reductionDecls);
+  SmallVector<llvm::Value *> privateReductionVariables(
+      tgOp.getNumReductionVars());
+  DenseMap<Value, llvm::Value *> reductionVariableMap;
+  MutableArrayRef<BlockArgument> reductionArgs =
+      tgOp.getRegion().getArguments();
 
   auto bodyCB = [&](InsertPointTy allocaIP, InsertPointTy codegenIP) {
+    SmallVector<llvm::PHINode *> phis;
+
     builder.restoreIP(codegenIP);
+    if (failed(allocAndInitializeTaskReductionVars(
+            tgOp, reductionArgs, builder, moduleTranslation, allocaIP,
+            reductionDecls, privateReductionVariables, reductionVariableMap,
+            isByRef)))
+      bodyGenStatus = failure();
+
     return convertOmpOpRegions(tgOp.getRegion(), "omp.taskgroup.region",
-                               builder, moduleTranslation)
+                               builder, moduleTranslation, &phis)
         .takeError();
   };
 
@@ -1770,7 +2038,7 @@ convertOmpTaskgroupOp(omp::TaskgroupOp tgOp, llvm::IRBuilderBase &builder,
     return failure();
 
   builder.restoreIP(*afterIP);
-  return success();
+  return bodyGenStatus;
 }
 
 static LogicalResult
